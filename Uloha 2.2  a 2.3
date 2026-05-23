@@ -1,0 +1,296 @@
+# ==============================================================================
+# 2.2 GMM ODHAD NKPC (FORWARD-LOOKING & HYBRID)
+# ==============================================================================
+library(gmm)
+
+# Příprava dat pro GMM
+# Potřebujeme: inflaci (π_t), očekávanou inflaci (E_t[π_{t+1}]), 
+# zpožděnou inflaci (π_{t-1}), a proxy pro reálné mezní náklady (s_t)
+
+uk_gmm <- uk_data_model %>%
+  mutate(
+    pi     = inflation,
+    pi_lag = lag(inflation, 1),
+    pi_fwd = lead(inflation, 1),  # E_t[π_{t+1}] – jako instrument
+    x_t    = output_gap,
+    s_t    = ulc_gap
+  ) %>%
+  drop_na()
+
+# ── REDUKOVANÁ PODOBA ──────────────────────────────────────────────────────────
+# Forward-looking NKPC (redukovaná):  π_t = β·E_t[π_{t+1}] + κ·s_t + ε_t
+# Instruments: lag(π,1), lag(π,2), lag(s,1), lag(s,2), lag(x,1)
+
+gmm_data_fl <- uk_gmm %>%
+  mutate(
+    pi_lag2 = lag(inflation, 2),
+    s_lag1  = lag(ulc_gap, 1),
+    s_lag2  = lag(ulc_gap, 2),
+    x_lag1  = lag(output_gap, 1)
+  ) %>%
+  drop_na()
+
+# Momentová podmínka pro forward-looking NKPC (redukovaná forma)
+# π_t = b_f * π_{t+1} + kappa * s_t
+moments_fl <- function(theta, x) {
+  b_f   <- theta[1]
+  kappa <- theta[2]
+  pi    <- x[, "pi"]
+  pi_f  <- x[, "pi_fwd"]
+  s_t   <- x[, "s_t"]
+  Z     <- x[, c("pi_lag", "pi_lag2", "s_lag1", "s_lag2", "x_lag1")]
+  resid <- pi - b_f * pi_f - kappa * s_t
+  return(resid * Z)
+}
+
+gmm_data_mat <- as.matrix(gmm_data_fl[, c("pi","pi_fwd","s_t","pi_lag",
+                                          "pi_lag2","s_lag1","s_lag2","x_lag1")])
+
+set.seed(42)
+gmm_fl <- gmm(moments_fl, x = gmm_data_mat,
+              t0 = c(b_f = 0.9, kappa = 0.1),
+              wmatrix = "optimal", vcov = "HAC")
+
+cat("\n=== GMM: Forward-looking NKPC (redukovaná forma, s_t = ULC gap) ===\n")
+print(summary(gmm_fl))
+
+# ── HYBRID NKPC (redukovaná podoba) ───────────────────────────────────────────
+# π_t = b_f * π_{t+1} + b_b * π_{t-1} + κ * s_t
+
+moments_hyb <- function(theta, x) {
+  b_f   <- theta[1]
+  b_b   <- theta[2]
+  kappa <- theta[3]
+  pi    <- x[, "pi"]
+  pi_f  <- x[, "pi_fwd"]
+  pi_l  <- x[, "pi_lag"]
+  s_t   <- x[, "s_t"]
+  Z     <- x[, c("pi_lag", "pi_lag2", "s_lag1", "s_lag2", "x_lag1")]
+  resid <- pi - b_f * pi_f - b_b * pi_l - kappa * s_t
+  return(resid * Z)
+}
+
+set.seed(42)
+gmm_hyb <- gmm(moments_hyb, x = gmm_data_mat,
+               t0 = c(b_f = 0.6, b_b = 0.3, kappa = 0.1),
+               wmatrix = "optimal", vcov = "HAC")
+
+cat("\n=== GMM: Hybrid NKPC (redukovaná forma, s_t = ULC gap) ===\n")
+print(summary(gmm_hyb))
+
+
+# ── J-TEST  ───────────────────────────────────────────────────
+j_fl  <- specTest(gmm_fl)
+j_hyb <- specTest(gmm_hyb)
+
+cat("\n--- J-test (overidentifying restrictions) ---\n")
+cat("Forward-looking: J =", round(j_fl$test[1], 4),
+    "  p-value =", round(j_fl$test[2], 4), "\n")
+cat("Hybrid:          J =", round(j_hyb$test[1], 4),
+    "  p-value =", round(j_hyb$test[2], 4), "\n")
+
+# ── RUČNÍ VÝPOČET REZIDUÍ ─────────────────────────────────────────────────────
+# Forward-looking: ε_t = π_t - b_f*π_{t+1} - κ*s_t
+coef_fl <- coef(gmm_fl)
+resid_fl <- gmm_data_mat[, "pi"] - 
+  coef_fl["b_f"]    * gmm_data_mat[, "pi_fwd"] - 
+  coef_fl["kappa"]  * gmm_data_mat[, "s_t"]
+
+# Hybrid: ε_t = π_t - b_f*π_{t+1} - b_b*π_{t-1} - κ*s_t
+coef_hyb <- coef(gmm_hyb)
+resid_hyb <- gmm_data_mat[, "pi"] - 
+  coef_hyb["b_f"]   * gmm_data_mat[, "pi_fwd"] - 
+  coef_hyb["b_b"]   * gmm_data_mat[, "pi_lag"] - 
+  coef_hyb["kappa"] * gmm_data_mat[, "s_t"]
+
+# ── BREUSCH-GODFREY TEST (ručně přes OLS pomocnou regresi) ────────────────────
+n <- length(resid_fl)
+
+# Pomocné proměnné jako data frame (zarovnané délky)
+bg_df_fl <- data.frame(
+  e     = resid_fl,
+  e_l1  = c(NA, resid_fl[-n]),
+  e_l2  = c(NA, NA, resid_fl[-c(n-1, n)]),
+  pi_f  = gmm_data_mat[, "pi_fwd"],
+  s_t   = gmm_data_mat[, "s_t"]
+) |> na.omit()
+
+bg_df_hyb <- data.frame(
+  e     = resid_hyb,
+  e_l1  = c(NA, resid_hyb[-n]),
+  e_l2  = c(NA, NA, resid_hyb[-c(n-1, n)]),
+  pi_f  = gmm_data_mat[, "pi_fwd"],
+  pi_l  = gmm_data_mat[, "pi_lag"],
+  s_t   = gmm_data_mat[, "s_t"]
+) |> na.omit()
+
+bg_aux_fl  <- lm(e ~ e_l1 + e_l2 + pi_f + s_t,           data = bg_df_fl)
+bg_aux_hyb <- lm(e ~ e_l1 + e_l2 + pi_f + pi_l + s_t,    data = bg_df_hyb)
+
+# LM statistika = n * R²
+lm_fl  <- nrow(bg_df_fl)  * summary(bg_aux_fl)$r.squared
+lm_hyb <- nrow(bg_df_hyb) * summary(bg_aux_hyb)$r.squared
+p_fl   <- pchisq(lm_fl,  df = 2, lower.tail = FALSE)
+p_hyb  <- pchisq(lm_hyb, df = 2, lower.tail = FALSE)
+
+cat("\n--- Breusch-Godfrey test (opomenutá dynamika, řád 2) ---\n")
+cat("Forward-looking: LM =", round(lm_fl, 4),  "  p-value =", round(p_fl, 4), "\n")
+cat("Hybrid:          LM =", round(lm_hyb, 4), "  p-value =", round(p_hyb, 4), "\n")
+
+
+
+# Rozšírená sada dát
+gmm_data_ext <- uk_gmm %>%
+  mutate(
+    pi_lag2 = lag(inflation, 2),
+    pi_lag3 = lag(inflation, 3),
+    pi_lag4 = lag(inflation, 4),
+    s_lag1  = lag(ulc_gap, 1),
+    s_lag2  = lag(ulc_gap, 2),
+    x_lag1  = lag(output_gap, 1),
+    x_lag2  = lag(output_gap, 2)
+  ) %>%
+  drop_na()
+
+gmm_data_mat2 <- as.matrix(gmm_data_ext[, c("pi","pi_fwd","pi_lag","pi_lag2",
+                                            "pi_lag3","pi_lag4","s_t",
+                                            "s_lag1","s_lag2",
+                                            "x_lag1","x_lag2")])
+
+# ── HYBRID s π_{t-2} (opomenutá dynamika řešena) ──────────────────────────────
+moments_hyb_ext <- function(theta, x) {
+  b_f    <- theta[1]
+  b_b    <- theta[2]
+  kappa  <- theta[3]
+  b_lag2 <- theta[4]   # koeficient π_{t-2}
+  pi     <- x[, "pi"]
+  pi_f   <- x[, "pi_fwd"]
+  pi_l   <- x[, "pi_lag"]
+  pi_l2  <- x[, "pi_lag2"]
+  s_t    <- x[, "s_t"]
+  # Rozšírené instrumenty
+  Z <- x[, c("pi_lag","pi_lag2","pi_lag3","pi_lag4",
+             "s_lag1","s_lag2","x_lag1","x_lag2")]
+  resid <- pi - b_f*pi_f - b_b*pi_l - kappa*s_t - b_lag2*pi_l2
+  return(resid * Z)
+}
+
+set.seed(42)
+gmm_hyb_ext <- gmm(moments_hyb_ext, x = gmm_data_mat2,
+                   t0 = c(b_f=0.6, b_b=0.3, kappa=0.1, b_lag2=0.1),
+                   wmatrix = "optimal", vcov = "HAC")
+
+cat("\n=== GMM: Hybrid NKPC rozšírený o π_{t-2} ===\n")
+print(summary(gmm_hyb_ext))
+
+# Nové rezidua a BG test
+coef_hyb_ext <- coef(gmm_hyb_ext)
+n2 <- nrow(gmm_data_mat2)
+
+resid_hyb_ext <- gmm_data_mat2[,"pi"] -
+  coef_hyb_ext["b_f"]    * gmm_data_mat2[,"pi_fwd"] -
+  coef_hyb_ext["b_b"]    * gmm_data_mat2[,"pi_lag"] -
+  coef_hyb_ext["kappa"]  * gmm_data_mat2[,"s_t"] -
+  coef_hyb_ext["b_lag2"] * gmm_data_mat2[,"pi_lag2"]
+
+bg_df_ext <- data.frame(
+  e    = resid_hyb_ext,
+  e_l1 = c(NA, resid_hyb_ext[-n2]),
+  e_l2 = c(NA, NA, resid_hyb_ext[-c(n2-1, n2)]),
+  pi_f = gmm_data_mat2[,"pi_fwd"],
+  pi_l = gmm_data_mat2[,"pi_lag"],
+  s_t  = gmm_data_mat2[,"s_t"]
+) |> na.omit()
+
+bg_aux_ext <- lm(e ~ e_l1 + e_l2 + pi_f + pi_l + s_t, data = bg_df_ext)
+lm_ext  <- nrow(bg_df_ext) * summary(bg_aux_ext)$r.squared
+p_ext   <- pchisq(lm_ext, df = 2, lower.tail = FALSE)
+
+cat("\n--- BG test po rozšírení ---\n")
+cat("Hybrid ext: LM =", round(lm_ext, 4), "  p-value =", round(p_ext, 4), "\n")
+j_hyb_ext <- specTest(gmm_hyb_ext)
+cat("J-test:     J  =", round(j_hyb_ext$test[1], 4),
+    "  p-value =", round(j_hyb_ext$test[2], 4), "\n")
+
+
+# ==============================================================================
+# 2.3 OMEZENÝ MODEL: β = 1 (TEST DLOUHODOBÉ VERTIKALITY)
+# ==============================================================================
+
+# ── OMEZENÝ HYBRID (b_f + b_b = 1, teda b_b = 1 - b_f) ──────────────────────
+moments_hyb_ext_restr <- function(theta, x) {
+  b_f    <- theta[1]
+  b_b    <- 1 - b_f        # omezení: b_f + b_b = 1
+  kappa  <- theta[2]
+  b_lag2 <- theta[3]
+  resid  <- x[,"pi"] - b_f*x[,"pi_fwd"] - b_b*x[,"pi_lag"] -
+    kappa*x[,"s_t"] - b_lag2*x[,"pi_lag2"]
+  Z <- x[, c("pi_lag","pi_lag2","pi_lag3","pi_lag4",
+             "s_lag1","s_lag2","x_lag1","x_lag2")]
+  return(resid * Z)
+}
+
+set.seed(42)
+gmm_hyb_ext_restr <- gmm(moments_hyb_ext_restr, x = gmm_data_mat2,
+                         t0 = c(b_f=0.6, kappa=0.1, b_lag2=0.1),
+                         wmatrix = "optimal", vcov = "HAC")
+
+cat("\n=== GMM: OMEZENÝ hybrid NKPC (β = b_f + b_b = 1) ===\n")
+print(summary(gmm_hyb_ext_restr))
+
+# ── WALDŮV TEST H0: b_f + b_b = 1 (na neomězeném modelu) ─────────────────────
+coef_ext <- coef(gmm_hyb_ext)
+vcov_ext  <- vcov(gmm_hyb_ext)
+
+# R·θ = 1, kde R = [1, 1, 0, 0] (testujeme b_f + b_b = 1)
+R        <- matrix(c(1, 1, 0, 0), nrow = 1)
+diff_val <- as.numeric(R %*% coef_ext) - 1
+W_stat   <- as.numeric(t(diff_val) %*% solve(R %*% vcov_ext %*% t(R)) %*% diff_val)
+p_wald   <- pchisq(W_stat, df = 1, lower.tail = FALSE)
+
+cat("\n--- Waldův test dlouhodobé vertikality (H0: b_f + b_b = 1) ---\n")
+cat("W =", round(W_stat, 4), "  p-value =", round(p_wald, 4), "\n")
+
+# ── POROVNÁNÍ KOEFICIENTŮ: omezený vs neomezený ───────────────────────────────
+coef_restr <- coef(gmm_hyb_ext_restr)
+
+cat("\n--- Porovnání odhadů: neomezený vs omezený model ---\n")
+comp_table <- data.frame(
+  Parameter   = c("b_f", "b_b", "kappa", "b_lag2", "b_f + b_b"),
+  Neomezeny   = c(
+    round(coef_ext["b_f"],    4),
+    round(coef_ext["b_b"],    4),
+    round(coef_ext["kappa"],  4),
+    round(coef_ext["b_lag2"], 4),
+    round(coef_ext["b_f"] + coef_ext["b_b"], 4)
+  ),
+  Omezeny = c(
+    round(coef_restr["b_f"],           4),
+    round(1 - coef_restr["b_f"],       4),
+    round(coef_restr["kappa"],         4),
+    round(coef_restr["b_lag2"],        4),
+    1.0000
+  )
+)
+print(comp_table)
+
+# ── J-TEST PRE OMEZENÝ MODEL ──────────────────────────────────────────────────
+j_restr <- specTest(gmm_hyb_ext_restr)
+cat("\nJ-test (omezený model): J =", round(j_restr$test[1], 4),
+    "  p-value =", round(j_restr$test[2], 4), "\n")
+
+moments_fl_restr <- function(theta, x) {
+  kappa <- theta[1]
+  lhs   <- x[, "pi"] - x[, "pi_fwd"]
+  s_t   <- x[, "s_t"]
+  Z     <- x[, c("pi_lag", "pi_lag2", "s_lag1", "s_lag2", "x_lag1")]
+  resid <- lhs - kappa * s_t
+  return(resid * Z)
+}
+
+set.seed(42)
+gmm_fl_restr <- gmm(moments_fl_restr, x = gmm_data_mat,
+                    t0 = c(kappa = 0.1),
+                    wmatrix = "optimal", vcov = "HAC")
+
+print(summary(gmm_fl_restr))
